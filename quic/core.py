@@ -110,10 +110,14 @@ class RttEstimator:
             self.smoothed_rtt = latest_rtt
             self.rttvar = latest_rtt / 2.0
         else:
-            self.min_rtt = min(self.min_rtt, latest_rtt)
-            adjusted = latest_rtt - delay
-            self.rttvar = (1.0 - ALPHA) * self.rttvar + ALPHA * abs(self.smoothed_rtt - adjusted)
-            self.smoothed_rtt += BETA * (adjusted - self.smoothed_rtt)
+            if latest_rtt < self.min_rtt + delay:
+                self.min_rtt = latest_rtt
+                adjusted = latest_rtt
+            else:
+                self.min_rtt = min(self.min_rtt, latest_rtt)
+                adjusted = latest_rtt - delay
+            self.rttvar = (1.0 - BETA) * self.rttvar + BETA * abs(self.smoothed_rtt - adjusted)
+            self.smoothed_rtt += ALPHA * (adjusted - self.smoothed_rtt)
         self.latest_rtt = latest_rtt
         self.samples += 1
         return self.smoothed_rtt
@@ -127,7 +131,7 @@ class RttEstimator:
     def rto(self) -> float:
         """The retransmission timeout derived from the smoothed estimate."""
         base = self.smoothed_rtt + max(4.0 * self.rttvar, self.granularity)
-        return min(base, self.max_rto)
+        return min(max(base, self.min_rto), self.max_rto)
 
 
 class QuicConnection:
@@ -210,8 +214,7 @@ class QuicConnection:
         if self.largest_acked_packet is None or largest_acked > self.largest_acked_packet:
             self.largest_acked_packet = largest_acked
 
-        if not self.sent_packets:
-            self.pto_count = 0
+        self.pto_count = 0
 
         if acked_bytes:
             self._on_packets_acked(acked_bytes)
@@ -240,7 +243,7 @@ class QuicConnection:
         if self.cwnd < self.ssthresh:
             self.cwnd += acked_bytes
         else:
-            self.cwnd += (MSS * MSS) // self.cwnd
+            self.cwnd += (acked_bytes * MSS) // self.cwnd
 
     def detect_lost_packets(self, now: float) -> List[SentPacket]:
         """Declare packets lost by the packet or the time threshold."""
@@ -253,7 +256,7 @@ class QuicConnection:
         lost: List[SentPacket] = []
         for packet_number in sorted(self.sent_packets):
             packet = self.sent_packets[packet_number]
-            if (packet_number < self.largest_acked_packet - K_PACKET_THRESHOLD
+            if (self.largest_acked_packet - packet_number >= K_PACKET_THRESHOLD
                     or packet.sent_time <= now - loss_delay):
                 lost.append(packet)
             elif self.loss_time is None:
@@ -267,13 +270,16 @@ class QuicConnection:
 
     def _on_packets_lost(self, lost: List[SentPacket], now: float) -> None:
         """Apply the congestion reaction for one batch of lost packets."""
-        for packet in lost:
-            self.recovery_start_time = now
-            self.cwnd = max(int(self.cwnd * LOSS_REDUCTION_FACTOR), MINIMUM_WINDOW)
+        oldest_sent_time = min(packet.sent_time for packet in lost)
+        if (self.recovery_start_time is not None
+                and oldest_sent_time <= self.recovery_start_time):
+            return
+        self.recovery_start_time = now
+        self.cwnd = max(int(self.cwnd * LOSS_REDUCTION_FACTOR), MINIMUM_WINDOW)
 
     def pto_period(self) -> float:
         """The probe timeout period used to arm the loss detection timer."""
-        return self.rtt.pto_duration()
+        return (2 ** self.pto_count) * self.rtt.pto_duration()
 
     def set_loss_detection_timer(self, now: float) -> Optional[float]:
         """Arm the single timer that drives loss detection and probing."""
